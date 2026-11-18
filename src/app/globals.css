@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+/* One accent hue (warm coral) across three themes; only the surfaces change.
+   Status colors (good / warn / bad) are tuned per theme for contrast. */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110;
+  --panel: #1a1a18;
+  --panel-2: #232320;
+  --line: #2f2f2b;
+  --text: #f1efe9;
+  --muted: #a29f96;
+  --accent: #f07a52;
+  --accent-ink: #1b0f0a;
+  --accent-2: #6fb6c9;
+  --good: #9fd68f;
+  --warn: #f2c66d;
+  --bad: #f19185;
+}
+
+[data-theme="dim"] {
+  color-scheme: dark;
+  --bg: #2a2925;
+  --panel: #33322d;
+  --panel-2: #3c3b35;
+  --line: #4a4841;
+  --text: #f3f0e8;
+  --muted: #b9b4a8;
+  --accent: #f28a65;
+  --accent-ink: #22130c;
+  --accent-2: #86c3d3;
+  --good: #a8dc98;
+  --warn: #f4cc78;
+  --bad: #f39a8e;
+}
+
+[data-theme="cream"] {
+  color-scheme: light;
+  --bg: #f4efe4;
+  --panel: #faf7ef;
+  --panel-2: #efe9dc;
+  --line: #ded6c5;
+  --text: #2a2620;
+  --muted: #6f6759;
+  --accent: #b94a24;
+  --accent-ink: #ffffff;
+  --accent-2: #2f7487;
+  --good: #2e6f2c;
+  --warn: #8a5a00;
+  --bad: #a8321f;
+}
+
+@theme inline {
+  --font-sans: var(--font-inter);
+  --font-display: var(--font-space-grotesk);
+  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-line: var(--line);
+  --color-fg: var(--text);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-2: var(--accent-2);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+h1,
+h2 {
+  font-family: var(--font-space-grotesk), system-ui, sans-serif;
+}
