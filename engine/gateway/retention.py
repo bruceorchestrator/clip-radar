@@ -25,6 +25,7 @@ import stacked
 QUEUE_CAP = 3
 REVIEW_TTL_HOURS = 12
 GRACE_SEC = 3600            # a reject clicked by mistake can still be undone for an hour
+MANUAL_KEEP_SEC = 48 * 3600  # a clip to post by hand stays downloadable this long
 OPEN = ("review", "approved")
 CLOSED = ("posted", "rejected")
 
@@ -69,10 +70,12 @@ def job_of(item: dict) -> str | None:
 
 
 def due_for_cleanup(state: dict, now: float, grace: float = GRACE_SEC) -> list[dict]:
-    """Closed clips whose files can go."""
+    """Closed clips whose files can go. A clip marked for posting by hand keeps its
+    file for MANUAL_KEEP_SEC, to be downloaded."""
     return [i for i in state.get("items", [])
             if i.get("status") in CLOSED and not i.get("files_removed")
-            and now - float(i.get("updated") or now) >= grace]
+            and now - float(i.get("updated") or now) >= (MANUAL_KEEP_SEC if i.get("posted_via") == "manual"
+                                                         else grace)]
 
 
 def jobs_in_use(state: dict) -> set[str]:

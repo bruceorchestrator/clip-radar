@@ -24,6 +24,8 @@ services:
       - ./overrides/gemini_worker.py:/app/gemini_worker.py:ro
       # Shot check through OpenRouter instead of a Gemini key (see overrides/sitecustomize.py).
       - ./overrides/openrouter_vision.py:/app/openrouter_vision.py:ro
+      # Webcam box route for the gateway (see overrides/clipradar_routes.py).
+      - ./overrides/clipradar_routes.py:/app/clipradar_routes.py:ro
       - ./overrides/sitecustomize.py:/opt/venv/lib/python3.11/site-packages/sitecustomize.py:ro
     mem_limit: 2800m
     memswap_limit: 6500m

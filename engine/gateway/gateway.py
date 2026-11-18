@@ -27,7 +27,7 @@ import traceback
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import autopilot
 import campaign_api
@@ -46,6 +46,8 @@ LENGTHS = {"short": (15, 30), "medium": (15, 45), "long": (30, 60)}
 # vertical: 9:16 reframe (Shorts, TikTok, Reels). horizontal: the stream frame as is (X).
 FORMATS = ("vertical", "horizontal")
 MAX_CLIPS = 30
+MAX_READY_SEC = 180          # a "ready clip" is a finished moment, not a stream
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 ALLOWED_HOSTS = ("twitch.tv", "kick.com", "youtube.com", "youtu.be")
 BATCH_ID = re.compile(r"^[0-9a-f]{32}$")
 TWITCH_GQL = "https://gql.twitch.tv/gql"
@@ -275,6 +277,48 @@ def engine_status(job_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Worker
 # --------------------------------------------------------------------------- #
+def duration_of(path: str) -> float:
+    out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path], 60)
+    return float(out.strip() or 0)
+
+
+def ready_settings(batch: dict, duration: float) -> dict:
+    """Core settings for a ready clip: one clip, as long as the file (the core still
+    transcribes it, writes the hook and burns captions)."""
+    settings = clip_settings({**batch, "clips": 1}, 1)
+    longest = int(duration) + 1
+    shortest = max(3, longest - 5)          # the core wants max at least 5 s above min
+    settings.update(clip_min_seconds=shortest, clip_max_seconds=max(longest, shortest + 5))
+    return settings
+
+
+def process_ready(batch: dict) -> None:
+    """A clip someone brought: the uploaded file, or the clip link downloaded whole."""
+    dest = batch.get("file") or os.path.join(DATA_DIR, "tmp", f"{batch['id']}_ready.mp4")
+    task = {"start": 0.0, "end": None, "reason": "ready clip", "state": "cutting",
+            "engine_job_id": None, "error": None}
+    update(batch, tasks=[task], status="running", stage="Getting the clip…")
+    try:
+        if not batch.get("file"):
+            run(["yt-dlp", "--no-warnings", "--no-playlist", "--no-part",
+                 "-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4",
+                 "-o", dest, batch["url"]], 900)
+        duration = duration_of(dest)
+        if not 3 <= duration <= MAX_READY_SEC:
+            raise RuntimeError(f"a ready clip is 3 s to {MAX_READY_SEC // 60} min long, this one is {duration:.0f} s; "
+                               "for a stream use a link and a time range")
+        task["end"] = duration
+        update(batch, duration=duration, stage="Captions and hook…")
+        task["engine_job_id"] = engine_submit_file(dest, ready_settings(batch, duration))
+        task["state"] = "submitted"
+    except Exception as exc:
+        task["state"], task["error"] = "failed", str(exc)[:300]
+    finally:
+        if os.path.exists(dest):
+            os.remove(dest)
+    update(batch, stage=None)
+
+
 def plan_batch(batch: dict) -> list[dict]:
     if batch.get("start") is not None and batch.get("end") is not None:
         return [{"start": batch["start"], "end": batch["end"], "reason": "chosen stretch"}]
@@ -298,6 +342,13 @@ def plan_batch(batch: dict) -> list[dict]:
 def process(batch_id: str) -> None:
     batch = load(batch_id)
     if not batch:
+        return
+    if batch.get("mode") == "ready":
+        try:
+            process_ready(batch)
+        except Exception as exc:
+            traceback.print_exc()
+            update(batch, status="failed", stage=None, error=str(exc)[:300])
         return
     try:
         tasks = plan_batch(batch)
@@ -353,14 +404,38 @@ def preview(url: str) -> dict:
             "stretch_sec": planner.STRETCH_SEC, "hotspots": spots}
 
 
-def new_batch(url: str, start, end, mode: str, clips: int, clip_length: str, fmt: str = "vertical") -> str:
-    batch = {"id": uuid.uuid4().hex, "url": url, "start": start, "end": end,
+def new_batch(url: str, start, end, mode: str, clips: int, clip_length: str, fmt: str = "vertical",
+              file: str | None = None, batch_id: str | None = None) -> str:
+    batch = {"id": batch_id or uuid.uuid4().hex, "url": url, "start": start, "end": end,
              "mode": "stretch" if start is not None else mode, "clips": clips,
              "length": clip_length, "format": fmt, "status": "planning", "stage": "Waiting in line…",
-             "tasks": [], "created": time.time()}
+             "tasks": [], "created": time.time(), "file": file}
     save(batch)
     _work.put(batch["id"])
     return batch["id"]
+
+
+def detect_webcam(video_path: str) -> list[float] | None:
+    """The streamer's webcam box in a core clip's source, as [x0, y0, x1, y1] fractions,
+    found by the core's own detector (route added by overrides/clipradar_routes.py)."""
+    clip = stacked.parse_clip(video_path)
+    if not clip:
+        return None
+    found = engine_json("GET", f"/api/clipradar/webcam/{clip['job']}", timeout=300)
+    box, width, height = found.get("box"), found.get("width"), found.get("height")
+    if not box or not width or not height:
+        return None
+    x, y, w, h = box
+    return [round(x / width, 4), round(y / height, 4), round((x + w) / width, 4), round((y + h) / height, 4)]
+
+
+def start_ready(url: str, streamer: str, name: str | None, hook: str | None, file: str | None = None,
+                batch_id: str | None = None) -> dict:
+    """A ready clip into the review queue of `streamer` (added if new)."""
+    login = autopilot.streamer_login(streamer)
+    batch_id = new_batch(url, None, None, "ready", 1, "medium", file=file, batch_id=batch_id)
+    AUTOPILOT.add_ready(batch_id, login, name, hook)
+    return {"id": batch_id, "streamer": login}
 
 
 def fetch_any_video(path: str) -> bytes:
@@ -430,7 +505,50 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, AUTOPILOT.snapshot())
         return self._json(404, {"error": "not found"})
 
+    def do_PUT(self):  # noqa: N802
+        """PUT /ready/upload?streamer=&name=&hook= with the video file as the body."""
+        parsed = urlparse(self.path)
+        if parsed.path != "/ready/upload":
+            return self._json(404, {"error": "not found"})
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not 10_000 <= length <= MAX_UPLOAD_BYTES:
+            return self._json(400, {"error": f"Send a video file up to {MAX_UPLOAD_BYTES // 2**20} MB."})
+        try:
+            autopilot.streamer_login(query.get("streamer", ""))
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
+        batch_id = uuid.uuid4().hex
+        dest = os.path.join(DATA_DIR, "tmp", f"{batch_id}_upload.mp4")
+        left = length
+        with open(dest, "wb") as fh:
+            while left > 0 and (chunk := self.rfile.read(min(1 << 20, left))):
+                fh.write(chunk)
+                left -= len(chunk)
+        if left:
+            os.remove(dest)
+            return self._json(400, {"error": "The upload was cut off."})
+        return self._json(201, start_ready("", query["streamer"], query.get("name"), query.get("hook"),
+                                           file=dest, batch_id=batch_id))
+
     def do_POST(self):  # noqa: N802
+        if self.path == "/ready":
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(min(length, 10_000)) or b"{}")
+            except (ValueError, json.JSONDecodeError):
+                return self._json(400, {"error": "Send a JSON body."})
+            url = str(body.get("url") or "").strip()
+            if not supported(url):
+                return self._json(400, {"error": "Paste a Twitch, Kick or YouTube clip link, or upload the file."})
+            try:
+                return self._json(201, start_ready(url, str(body.get("streamer") or ""), body.get("name"),
+                                                   body.get("hook")))
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
         if self.path == "/autopilot/run":
             AUTOPILOT.run_requested.set()
             AUTOPILOT.wake.set()
@@ -591,6 +709,7 @@ AUTOPILOT = autopilot.Autopilot(
     view_batch=lambda batch: view(batch),
     load_batch=lambda batch_id: load(batch_id),
     fetch_video=fetch_any_video,
+    detect_webcam=detect_webcam,
 )
 
 

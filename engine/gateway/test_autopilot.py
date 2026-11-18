@@ -199,7 +199,7 @@ class TestStackedLayout(unittest.TestCase):
         self.assertEqual(items["a"]["video_path"], "/videos/stacked/" + "a" * 32 + "-0123abcd.mp4")
         self.assertEqual(items["a"]["engine_video_path"], self.ENGINE)
         self.assertEqual(items["a"]["layout"], "stacked")
-        self.assertNotIn("layout", items["b"])          # no webcam box for Clix
+        self.assertEqual(items["b"]["layout"], "engine")  # no webcam box for Clix: the core's framing
         self.assertNotIn("layout", items["c"])          # already posted
         self.pilot.restack_new()
         self.assertEqual(len(self.calls), 1)
@@ -256,15 +256,15 @@ class TestPostClipCover(unittest.TestCase):
     def test_youtube_upload_carries_the_cover_and_reports_a_refused_one(self):
         import json
         from unittest import mock
-        import autopilot
+        import posting
         sent = {}
 
         def fake(path, body, content_type, idempotency=None):
             sent.update(path=path, body=body)
             return {"results": {"youtube": {"success": True, "url": "https://youtu.be/x",
                                             "thumbnail_error": "channel not verified"}}}
-        with mock.patch.object(autopilot, "_upload_post", side_effect=fake):
-            out = autopilot.post_clip({"id": "i1"}, {"upload_post_user": "default", "platforms": ["youtube"]},
+        with mock.patch.object(posting, "_upload_post", side_effect=fake):
+            out = posting.post_upload_post({"id": "i1"}, {"user": "default", "platforms": ["youtube"]},
                                       b"VIDEO", {"title": "t", "caption": "c"}, cover=b"\xff\xd8JPEG")
         self.assertEqual(sent["path"], "/api/upload")
         self.assertIn(b'name="thumbnail"; filename="cover.jpg"', sent["body"])
@@ -275,9 +275,9 @@ class TestPostClipCover(unittest.TestCase):
 
     def test_no_cover_field_without_youtube(self):
         from unittest import mock
-        import autopilot
+        import posting
         sent = {}
-        with mock.patch.object(autopilot, "_upload_post", side_effect=lambda p, b, c, idempotency=None: sent.update(body=b) or {"results": {}}):
-            autopilot.post_clip({"id": "i1"}, {"upload_post_user": "u", "platforms": ["tiktok"]}, b"V",
+        with mock.patch.object(posting, "_upload_post", side_effect=lambda p, b, c, idempotency=None: sent.update(body=b) or {"results": {}}):
+            posting.post_upload_post({"id": "i1"}, {"user": "u", "platforms": ["tiktok"]}, b"V",
                                 {"title": "t", "caption": "c"}, cover=b"JPEG")
         self.assertNotIn(b'name="thumbnail"', sent["body"])

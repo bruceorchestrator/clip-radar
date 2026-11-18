@@ -420,3 +420,42 @@ export async function actOnAutopilotItem(id: string, action: AutopilotAction, ta
     throw new EngineError(typeof body.error === "string" ? body.error : "Could not update the clip.", response.status === 404 ? 404 : 400);
   }
 }
+
+export type ReadyClip = { streamer: string; name?: string; hook?: string };
+
+async function readyReply(response: Response): Promise<{ id: string; streamer: string }> {
+  const body = (await response.json().catch(() => ({}))) as { id?: unknown; streamer?: unknown; error?: unknown };
+  if (!response.ok || typeof body.id !== "string") {
+    throw new EngineError(typeof body.error === "string" ? body.error : "Could not start the clip.", response.ok ? 502 : 400);
+  }
+  return { id: body.id, streamer: typeof body.streamer === "string" ? body.streamer : "" };
+}
+
+/** A finished moment by link (a Kick/Twitch/YouTube clip): captions, hook, layout, review queue. */
+export async function startReadyClip(url: string, clip: ReadyClip): Promise<{ id: string; streamer: string }> {
+  const response = await engineFetch("/ready", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, ...clip }),
+  });
+  return readyReply(response);
+}
+
+/** The same for a video file someone has (downloaded from a clip library, recorded, ...). */
+export async function uploadReadyClip(file: Blob, clip: ReadyClip): Promise<{ id: string; streamer: string }> {
+  const query = new URLSearchParams({ streamer: clip.streamer });
+  if (clip.name) query.set("name", clip.name);
+  if (clip.hook) query.set("hook", clip.hook);
+  let response: Response;
+  try {
+    response = await fetch(`${GATEWAY_URL}/ready/upload?${query}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": String(file.size) },
+      body: Buffer.from(await file.arrayBuffer()),
+      signal: AbortSignal.timeout(10 * 60_000),
+    });
+  } catch {
+    throw new EngineError("The clipping engine is not reachable.", 502);
+  }
+  return readyReply(response);
+}

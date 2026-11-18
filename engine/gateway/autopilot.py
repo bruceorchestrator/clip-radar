@@ -13,8 +13,8 @@ Loop (every `interval_min`, and at once when a clip is rejected or posted):
    to Telegram so they can be submitted to the campaign within 30 minutes.
 
 Config: <DATA_DIR>/autopilot.json (see DEFAULT_CONFIG). State: autopilot_state.json.
-Secrets come from the environment: UPLOAD_POST_API_KEY, TELEGRAM_BOT_TOKEN,
-TELEGRAM_CHAT_ID. Without the Upload-Post key nothing is posted; approved clips wait.
+Secrets come from the environment: the posting service's key (posting.py), TELEGRAM_BOT_TOKEN,
+TELEGRAM_CHAT_ID. Without the key of an account's service nothing goes there; approved clips wait.
 
 Pure helpers (pick_spots, build_post_text, clips_from_view, apply_action) are
 unit-tested in test_autopilot.py.
@@ -23,10 +23,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import traceback
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -37,6 +37,7 @@ import headline
 import clip_campaigns
 from clip_campaigns import build_post_text, campaign_for, item_checks  # noqa: F401 (re-exported)
 import planner
+import posting
 import retention
 import stacked
 import thumbnail
@@ -123,10 +124,21 @@ def pick_spots(nodes: list[dict], game: str | None, seen: set[str], limit: int,
     return out
 
 
-def posting_accounts(streamer: dict) -> list[dict]:
-    """Where a streamer's clips go: `accounts` [{user, platforms, name}], or the older
-    single `upload_post_user` + `platforms`."""
-    accounts = [a for a in streamer.get("accounts") or [] if a.get("user") and a.get("platforms")]
+def posting_accounts(streamer: dict, fallback: list | None = None) -> list[dict]:
+    """Where a streamer's clips go: its `accounts`, else the config's top-level
+    `accounts`, else the older single `upload_post_user` + `platforms`.
+
+    An account is {name, platforms, via (posting.py), ...}; its "user" (the
+    Upload-Post profile, else its id or name) is its key in the queue and the UI."""
+    accounts = []
+    for account in streamer.get("accounts") or fallback or []:
+        if not isinstance(account, dict) or not account.get("platforms"):
+            continue
+        if posting.service(account) == "upload-post" and not account.get("user"):
+            continue
+        key = account.get("user") or account.get("id") or account.get("name")
+        if key:
+            accounts.append({**account, "user": str(key)})
     if accounts:
         return accounts
     if streamer.get("upload_post_user") and streamer.get("platforms"):
@@ -195,6 +207,22 @@ def load_config(data_dir: str) -> dict:
         return json.load(f)
 
 
+def save_config(data_dir: str, config: dict) -> None:
+    path, _ = _paths(data_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    os.replace(tmp, path)
+
+
+def streamer_login(text: str) -> str:
+    """A streamer key from a name or login: lower case, letters, digits and _."""
+    login = re.sub(r"[^a-z0-9_]", "", (text or "").strip().lower())[:40]
+    if not login:
+        raise ValueError("name the streamer")
+    return login
+
+
 def load_state(data_dir: str) -> dict:
     _, path = _paths(data_dir)
     try:
@@ -233,67 +261,11 @@ def notify(text: str) -> None:
         print(f"autopilot: telegram failed: {exc}", flush=True)
 
 
-def _multipart(fields: list[tuple[str, str]], files: list[tuple[str, str, str, bytes]]) -> tuple[bytes, str]:
-    """files: (field, filename, content type, bytes)."""
-    boundary = uuid.uuid4().hex
-    parts = []
-    for name, value in fields:
-        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
-    for field, filename, content_type, data in files:
-        parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n".encode() + data + b"\r\n")
-    parts.append(f"--{boundary}--\r\n".encode())
-    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
-
-
-def _upload_post(path: str, body: bytes, content_type: str, idempotency: str | None = None) -> dict:
-    headers = {"Authorization": f"Apikey {os.environ['UPLOAD_POST_API_KEY']}", "Content-Type": content_type}
-    if idempotency:
-        headers["Idempotency-Key"] = idempotency
-    req = urllib.request.Request(f"https://api.upload-post.com{path}", data=body, method="POST", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        raise RuntimeError(f"Upload-Post {exc.code}: {detail}") from exc
-
-
-def set_youtube_thumbnail(user: str, video_id: str, cover: bytes) -> dict:
-    """Cover for a Short that is already on YouTube (Upload-Post queues it while YouTube processes)."""
-    body, content_type = _multipart([("user", user), ("video_id", video_id)],
-                                    [("thumbnail", "cover.jpg", "image/jpeg", cover)])
-    return _upload_post("/api/uploadposts/youtube/thumbnail", body, content_type)
-
-
-def post_clip(item: dict, streamer: dict, video_bytes: bytes, text: dict, cover: bytes | None = None) -> dict:
-    """Post through Upload-Post with the caption from the campaign check and, for
-    YouTube, the cover image; returns {platform: url or error}."""
-    fields = [("user", streamer["upload_post_user"]), ("title", text["title"]),
-              ("tiktok_title", text["caption"]), ("instagram_title", text["caption"]),
-              ("youtube_title", text["title"]), ("description", text["caption"])]
-    fields += [("platform[]", p) for p in streamer.get("platforms") or []]
-    files = [("video", "clip.mp4", "video/mp4", video_bytes)]
-    if cover and "youtube" in (streamer.get("platforms") or []):
-        files.append(("thumbnail", "cover.jpg", "image/jpeg", cover))
-    body, content_type = _multipart(fields, files)
-    reply = _upload_post("/api/upload", body, content_type, idempotency=item["id"])
-    out = {}
-    for platform, result in (reply.get("results") or {}).items():
-        out[platform] = result.get("url") if result.get("success") else f"error: {result.get('error')}"
-        problem = result.get("thumbnail_error") or (result.get("thumbnail_note") if not (
-            result.get("thumbnail_set") or result.get("thumbnail_pending")) else None)
-        if cover and platform == "youtube" and problem:
-            out["youtube cover"] = f"error: {problem}"
-    if not out and reply.get("request_id"):
-        out["pending"] = f"processing in background, request {reply['request_id']}"
-    return out
-
-
 class Autopilot:
-    def __init__(self, data_dir: str, gql, create_batch, view_batch, load_batch, fetch_video):
+    def __init__(self, data_dir: str, gql, create_batch, view_batch, load_batch, fetch_video,
+                 detect_webcam=None):
         self.data_dir = data_dir
+        self.detect_webcam = detect_webcam  # (core clip path) -> [x0, y0, x1, y1] fractions or None
         self.gql = gql                      # (query, variables) -> data
         self.create_batch = create_batch    # (url, start, end, clips, length) -> batch id
         self.view_batch = view_batch        # (batch dict) -> view with engine status
@@ -345,10 +317,19 @@ class Autopilot:
             if view["status"] not in ("completed", "failed"):
                 still.append(entry)
                 continue
-            for clip in clips_from_view(view, int(config.get("min_score") or 0)):
+            clips = clips_from_view(view, int(config.get("min_score") or 0))
+            if entry.get("ready"):
+                # A clip someone brought (the moment is theirs): its one cut, whatever the score.
+                clips = clips_from_view(view, 0)[:1]
+                if view["status"] == "failed" or not clips:
+                    log(state, f"ready clip for {entry['streamer']} failed in the core")
+            for clip in clips:
+                if entry.get("hook"):
+                    clip["hook"] = entry["hook"]
                 state.setdefault("items", []).append({
                     **clip, "id": uuid.uuid4().hex, "streamer": entry["streamer"], "batch": entry["batch"],
                     "vod": entry.get("vod"), "vod_started": entry.get("vod_started"),
+                    "ready": bool(entry.get("ready")),
                     "status": "review", "posts": {}, "created": time.time(), "updated": time.time()})
                 new_items += 1
         state["pending"] = still
@@ -359,19 +340,20 @@ class Autopilot:
     def post_approved(self, config: dict, state: dict) -> None:
         """Post every clip a person sent to a channel (status approved + post_to), right away.
         Nothing is posted without that click."""
-        if not os.environ.get("UPLOAD_POST_API_KEY"):
-            return
         campaigns = campaign_rules.load_campaigns(self.data_dir)
         streamers = {s["login"]: s for s in config.get("streamers", [])}
         for item in state.get("items", []):
             streamer = streamers.get(item.get("streamer"))
             if item.get("status") != "approved" or not streamer or not item.get("post_to"):
                 continue
-            account = next((a for a in posting_accounts(streamer) if a["user"] == item["post_to"]), None)
+            account = next((a for a in posting_accounts(streamer, config.get("accounts"))
+                            if a["user"] == item["post_to"]), None)
             if not account:
                 item.update(status="review", updated=time.time())
                 log(state, f"{item['id'][:8]} sent back to review: channel {item['post_to']} is not connected")
                 continue
+            if not posting.ready(account):
+                continue                    # its service has no key yet: the clip waits, approved
             target = {**streamer, "upload_post_user": account["user"], "platforms": account["platforms"]}
             check = item_checks(item, target, campaigns)
             broken = clip_campaigns.broken_rules(check)
@@ -385,10 +367,15 @@ class Autopilot:
         name = account.get("name") or account["user"]
         try:
             text = check["text"] or build_post_text(item, target)
-            cover = self._cover(item) if "youtube" in (target.get("platforms") or []) else None
-            links = post_clip(item, target, self.fetch_video(item["video_path"]), text, cover)
+            cover = self._cover(item) if posting.wants_cover(account) else None
+            links = posting.post(item, account, self.fetch_video(item["video_path"]), text, cover)
+            # A gateway path (manual posting: the file to download) as a web app link.
+            app = os.environ.get("APP_URL", "").rstrip("/")
+            links = {p: (f"{app}/api{u}" if isinstance(u, str) and u.startswith("/videos/") else u)
+                     for p, u in links.items()}
             item.update(status="posted", posts={f"{name} {p}": u for p, u in links.items()},
-                        posted_to=name, posted=time.time(), updated=time.time())
+                        posted_to=name, posted_via=posting.service(account),
+                        posted=time.time(), updated=time.time())
             lines = "\n".join(f"{p}: {u}" for p, u in links.items())
             chosen = [r["campaign"] for r in check["campaigns"] if r["selected"]]
             minutes = min([c.get("submit_within_min") or CAMPAIGN_SUBMIT_MINUTES for c in chosen]
@@ -402,6 +389,27 @@ class Autopilot:
         except Exception as exc:
             item.update(status="failed", error=str(exc)[:300], updated=time.time())
             log(state, f"posting {item['id'][:8]} on {name} failed: {exc}")
+
+    def add_ready(self, batch_id: str, login: str, name: str | None = None, hook: str | None = None) -> str:
+        """Queue a ready clip (a file or a clip link someone brought) for `login`.
+        A streamer not in the config is added with the autopilot off for it; it posts
+        through the config's top-level `accounts`."""
+        login = streamer_login(login)
+        with STATE_LOCK:
+            config = load_config(self.data_dir)
+            if not any(s.get("login") == login for s in config.get("streamers", [])):
+                display = (name or login).strip()[:40]
+                config.setdefault("streamers", []).append({
+                    "login": login, "name": display, "enabled": False,
+                    "hashtags": ["#" + re.sub(r"\W", "", display)]})
+                save_config(self.data_dir, config)
+            state = load_state(self.data_dir)
+            state.setdefault("pending", []).append({"batch": batch_id, "streamer": login, "ready": True,
+                                                    "hook": (hook or "").strip()[:120] or None})
+            log(state, f"{login}: ready clip queued, batch {batch_id[:8]}")
+            save_state(self.data_dir, state)
+        self.wake.set()
+        return login
 
     def run_once(self, force_find: bool = False) -> None:
         with STATE_LOCK:
@@ -462,13 +470,18 @@ class Autopilot:
         public = {k: v for k, v in config.items() if k != "streamers"}
         public["streamers"] = [{**{k: s.get(k) for k in ("login", "name", "enabled", "since", "platforms",
                                                          "upload_post_user", "campaign")},
-                                "accounts": [{"user": a["user"], "name": a.get("name") or a["user"]} for a in posting_accounts(s)]}
+                                "accounts": [{"user": a["user"], "name": a.get("name") or a["user"],
+                                              "via": posting.service(a), "platforms": a.get("platforms") or [],
+                                              "ready": posting.ready(a)}
+                                             for a in posting_accounts(s, config.get("accounts"))]}
                                for s in config.get("streamers", [])]
         campaigns = campaign_rules.load_campaigns(self.data_dir)
         streamers = {s["login"]: s for s in config.get("streamers", [])}
         items = sorted(state.get("items", []), key=lambda i: -i.get("created", 0))[:200]
         items = [{**i, **item_checks(i, streamers.get(i.get("streamer")), campaigns)} for i in items]
-        return {"config": public, "posting_ready": bool(os.environ.get("UPLOAD_POST_API_KEY")),
+        ready = any(posting.ready(a) for s in config.get("streamers", [])
+                    for a in posting_accounts(s, config.get("accounts")))
+        return {"config": public, "posting_ready": ready,
                 "last_run": state.get("last_run"), "pending": state.get("pending", []),
                 "items": items, "campaigns": campaigns, "log": state.get("log", [])[-30:]}
 
@@ -490,31 +503,65 @@ class Autopilot:
         layout = (streamer or {}).get("layout") or {}
         return layout if layout.get("cam") else None
 
+    def _layout_for(self, item: dict) -> dict | None:
+        """The streamer's webcam box, else the one found in this clip (detect_webcam)."""
+        layout = self._streamer_layout(item.get("streamer"))
+        if layout:
+            return layout
+        return {"cam": item["cam"], "game_center": 0.5} if item.get("cam") else None
+
+    def _update_item(self, item_id: str, **fields) -> None:
+        with STATE_LOCK:
+            state = load_state(self.data_dir)
+            current = next((i for i in state.get("items", []) if i.get("id") == item_id), None)
+            if current is not None:
+                current.update(fields)
+                save_state(self.data_dir, state)
+
     def restack_new(self) -> bool:
-        """Give ONE new clip of a streamer with a webcam box the stacked layout (webcam
-        on top, game below); True while more are waiting. One per call, because a
-        render takes ~40 s and the loop must post a clicked clip between renders
-        instead of after the whole queue. Renders outside the state lock."""
+        """Give ONE new clip the stacked layout (webcam on top, game below); True while
+        more are waiting. One per call, because a render takes ~40 s and the loop must
+        post a clicked clip between renders instead of after the whole queue. The
+        webcam box is the streamer's, else found in the clip by the core's detector;
+        a clip without one keeps the core's layout. Renders outside the state lock."""
         with STATE_LOCK:
             state = load_state(self.data_dir)
             # New clips, and stacked clips rendered by an older look (stacked.RENDER_VERSION).
-            todo = [(i, layout) for i in state.get("items", [])
+            todo = [i for i in state.get("items", [])
                     if i.get("status") == "review" and not i.get("headline")
                     and ("layout" not in i or (i.get("layout") == "stacked"
-                                               and i.get("stacked_version") != stacked.RENDER_VERSION))
-                    for layout in [self._streamer_layout(i.get("streamer"))] if layout]
-        if not todo:
+                                               and i.get("stacked_version") != stacked.RENDER_VERSION))]
+            renderable = []
+            for item in todo:
+                if self._layout_for(item) or (self.detect_webcam and not item.get("cam_checked")):
+                    renderable.append(item)
+                elif "layout" not in item:
+                    item["layout"] = "engine"        # no webcam box known or found: the core's framing
+            save_state(self.data_dir, state)
+        if not renderable:
             return False
-        for item, layout in todo[:1]:
-            error = self.set_layout(item["id"], "stacked", layout)
-            if error and error != "not found":
-                with STATE_LOCK:
-                    state = load_state(self.data_dir)
-                    current = next((i for i in state.get("items", []) if i.get("id") == item["id"]), None)
-                    if current is not None and "layout" not in current:
-                        current.update(layout="engine", layout_error=error[:200])
-                        save_state(self.data_dir, state)
-        return len(todo) > 1
+        item = renderable[0]
+        layout = self._layout_for(item)
+        if not layout:
+            cam = None
+            try:
+                cam = self.detect_webcam(item.get("engine_video_path") or item["video_path"])
+            except Exception as exc:
+                print(f"autopilot: webcam search in {item['id'][:8]} failed: {exc}", flush=True)
+            self._update_item(item["id"], cam_checked=True, **({"cam": cam} if cam else {}))
+            if not cam:
+                self._update_item(item["id"], layout="engine", layout_error="no webcam found in the clip")
+                return len(renderable) > 1
+            layout = {"cam": cam, "game_center": 0.5}
+        error = self.set_layout(item["id"], "stacked", layout)
+        if error and error != "not found":
+            with STATE_LOCK:
+                state = load_state(self.data_dir)
+                current = next((i for i in state.get("items", []) if i.get("id") == item["id"]), None)
+                if current is not None and "layout" not in current:
+                    current.update(layout="engine", layout_error=error[:200])
+                    save_state(self.data_dir, state)
+        return len(renderable) > 1
 
     def set_layout(self, item_id: str, which: str, layout: dict | None = None) -> str | None:
         """Switch a clip between the stacked layout ("stacked") and the core's own ("engine")."""
@@ -523,7 +570,7 @@ class Autopilot:
         with STATE_LOCK:
             item = next((i for i in load_state(self.data_dir).get("items", []) if i.get("id") == item_id), None)
             if item and which == "stacked" and layout is None:
-                layout = self._streamer_layout(item.get("streamer"))
+                layout = self._layout_for(item)
         if not item:
             return "not found"
         if item.get("status") not in ("review", "approved"):
@@ -575,7 +622,7 @@ class Autopilot:
     def _clean_clip(self, item: dict) -> bytes:
         """The clip without burned captions, in the layout it has now."""
         if item.get("layout") == "stacked":
-            layout = self._streamer_layout(item.get("streamer"))
+            layout = self._layout_for(item)
             if not layout:
                 raise RuntimeError("this streamer has no webcam box set")
             path = stacked.render(item["engine_video_path"], layout, stacked.folder(self.data_dir),
@@ -635,7 +682,8 @@ class Autopilot:
                     save_state(self.data_dir, state)
                 return error
             if action == "post":
-                account = next((a for a in posting_accounts(streamer or {}) if a["user"] == campaign_id), None)
+                account = next((a for a in posting_accounts(streamer or {}, config.get("accounts"))
+                                if a["user"] == campaign_id), None)
                 if not account:
                     return "pick a connected channel"
                 target = {**streamer, "upload_post_user": account["user"], "platforms": account["platforms"]}

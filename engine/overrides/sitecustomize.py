@@ -4,6 +4,7 @@ Patches modules of the unmodified OpenShorts core right after they are first
 imported, so our changes live in overrides/ instead of a fork:
   - screencast_layout.detect_content_ranges -> openrouter_vision (shot check
     through OpenRouter instead of a direct Gemini key).
+  - app (the FastAPI app) -> clipradar_routes.install (webcam box route for the gateway).
 """
 import importlib.abc
 import importlib.machinery
@@ -14,6 +15,7 @@ PATCHES = {
         module, "detect_content_ranges", __import__("openrouter_vision").detect_content_ranges),
     "camera_inset": lambda module: setattr(
         module, "present_in_scene", __import__("openrouter_vision").present_in_scene(module.present_in_scene)),
+    "app": lambda module: __import__("clipradar_routes").install(module),
 }
 
 

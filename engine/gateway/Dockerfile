@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
     && useradd -r -m gateway && mkdir -p /data && chown gateway /data
 WORKDIR /app
 COPY fonts/ /app/fonts/
-COPY autopilot.py brief_import.py campaign_api.py campaigns.py clip_campaigns.py headline.py hls.py planner.py retention.py stacked.py thumbnail.py gateway.py test_headline.py test_stacked.py test_thumbnail.py test_retention.py ./
+COPY autopilot.py brief_import.py campaign_api.py campaigns.py clip_campaigns.py headline.py hls.py planner.py posting.py retention.py stacked.py thumbnail.py gateway.py test_headline.py test_stacked.py test_thumbnail.py test_retention.py test_posting.py test_ready.py ./
 USER gateway
 EXPOSE 8100
 CMD ["python", "-u", "gateway.py"]

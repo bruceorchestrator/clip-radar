@@ -21,11 +21,23 @@ stretch takes 12-15 minutes to process.
 
 ## 2. How it works (the chain)
 
+Three ways in, one way through, a choice of ways out:
+
 ```
-trigger -> radar -> stretch -> core (Whisper + LLM + crop + captions) -> score filter
-        -> review queue -> stacked layout -> campaign check -> person clicks Post
-        -> cover + Upload-Post -> Telegram links -> cleanup
+IN   autopilot (radar of viewer clips)  -+
+     link + time range (Create page)     +-> core (Whisper + LLM + crop + captions)
+     ready clip: file or clip link       -+         |
+                                                    v
+     review queue -> stacked layout (webcam found or configured) + hook + captions
+     -> campaign check -> person clicks Post
+OUT  -> Upload-Post | Postiz | manual (download)  -> Telegram links -> cleanup
 ```
+
+Adapt it to how the person works; nothing has to be removed:
+- They pick moments themselves or take them from a clip library (a community site, a
+  Discord, a Telegram group): use **ready clips** (section 2b). No radar, no moment search.
+- They want the machine to find moments: the **autopilot** (steps 0-2 below).
+- They post with another tool or by hand: pick the posting service per account (section 2c).
 
 0. **Trigger (autopilot, `engine/gateway/autopilot.py`).** The gateway loop wakes every
    `interval_min` (15), right after a clip is rejected or posted, or on `POST /autopilot/run`.
@@ -60,8 +72,8 @@ trigger -> radar -> stretch -> core (Whisper + LLM + crop + captions) -> score f
    length, no CJK captions. A broken rule blocks posting. The rest (main focus, no logos, no
    negative framing) is a human checklist on the clip.
 7. **Post, only by a click.** "Post to <channel>" on a clip: a cover is made (`thumbnail.py`:
-   frame at the loudest half-second + the hook), the clip goes out through Upload-Post to that
-   channel's platforms, and Telegram gets the links plus "submit within N minutes" (Reach wants
+   frame at the loudest half-second + the hook), the clip goes out through that account's
+   posting service (section 2c) to its platforms, and Telegram gets the links plus "submit within N minutes" (Reach wants
    links in Content Rewards within 30 minutes of posting).
 8. **Cleanup (`retention.py`).** A clip unreviewed for `review_ttl_hours` (12) expires. An hour
    after a clip is posted or rejected, its renders and the core's job files (stream stretch,
@@ -71,6 +83,40 @@ Manual path: the web app's **Create** page takes a link plus a time range and ru
 a one-off job (vertical or 16:9 for X). The **Radar** page shows the hottest viewer clips of a
 category on Twitch and Kick.
 
+### 2b. Ready clips (a moment someone already picked)
+
+Create page, "Already have the clip?": pick the streamer (or type a new one), upload the video
+or paste a Kick/Twitch/YouTube clip link, optionally write the hook. API: `POST /ready`
+`{url, streamer, name?, hook?}` or `PUT /ready/upload?streamer=&name=&hook=` with the file as the
+body (gateway). The clip (3 s to 3 min) goes to the core as one piece (one clip, as long as the
+file: captions, hook, title), then into the review queue whatever its score. A streamer not in
+the config is added with the autopilot off and posts through the config's top-level `accounts`.
+To plug in a clip library with an API or an export folder, call these two endpoints from a small
+script; for a login-only site, download the file and upload it.
+
+**Webcam box.** A streamer's own `layout.cam` wins. Without one, the gateway asks the core
+(`GET /api/clipradar/webcam/<job>`, `engine/overrides/clipradar_routes.py`) to find the webcam:
+faces (else people) anchored to a corner, stable across 12 frames. Game close-ups in the middle
+are ignored. The found box hugs the face, so the top band is a little tighter than the real
+webcam. Not found: the clip keeps the core's own framing (`layout_error` says why). The box is
+stored per clip (`cam`); put it in the streamer's `layout.cam` to reuse it.
+
+### 2c. Posting services (`engine/gateway/posting.py`)
+
+Each account names its service with `via`:
+- `upload-post` (default): hosted, already-approved YouTube/TikTok apps, key
+  `UPLOAD_POST_API_KEY`. Free plan: 10 uploads a month.
+- `postiz`: postiz.com cloud or self-hosted Postiz (open source). Keys `POSTIZ_API_KEY`,
+  `POSTIZ_URL` (self-hosted: `https://<host>/api/public/v1`). The account lists
+  `integrations: {platform: <id>}` (ids from `GET <POSTIZ_URL>/integrations`). Self-hosted
+  Postiz needs its own platform apps: YouTube keeps uploads from an unverified Google API
+  project private, and X charges per post through its API.
+- `manual`: nothing is sent; the clip is marked posted and the download link goes to
+  Telegram (set `APP_URL` to the web app address for full links). Files stay 48 hours.
+
+Add a service: a `post_<name>(item, account, video, text, cover)` returning
+`{platform: url or "error: ..."}`, register it in `SERVICES` and `ENV`, add a test.
+
 ## 3. Repo map
 
 | Path | What |
@@ -79,14 +125,15 @@ category on Twitch and Kick.
 | `src/lib/sources/` | Radar sources: `twitch.ts`, `kick.ts` (Kick's unofficial site API, no key). |
 | `engine/docker-compose.yml` | Core + gateway, both on 127.0.0.1 only. |
 | `engine/gateway/` | Python stdlib HTTP gateway (port 8100): batches, autopilot, layouts, covers, campaigns, posting. Tests `test_*.py`. |
-| `engine/overrides/` | Mounted into the core: `gemini_worker.py` (upstream file with our prompts, generated by `engine/apply_prompts.py`), `openrouter_vision.py` + `sitecustomize.py` (shot check through OpenRouter instead of a Gemini key). |
+| `engine/overrides/` | Mounted into the core: `gemini_worker.py` (upstream file with our prompts, generated by `engine/apply_prompts.py`), `openrouter_vision.py` + `sitecustomize.py` (shot check through OpenRouter instead of a Gemini key), `clipradar_routes.py` (webcam box route). |
 | `engine/prompts.py` | Our moment-selection prompts. |
 | `engine/*.env.example` | Env templates. |
 
 ## 4. Setup from zero
 
 Needs: a Linux server with Docker (2+ cores, 4+ GB RAM, 60+ GB disk), an OpenRouter key.
-Optional: Upload-Post account + key (posting), a Telegram bot (pings).
+Optional: a posting service (Upload-Post or Postiz key; or none, posting by hand), a Telegram
+bot (pings).
 
 ```bash
 git clone <this repo> clip-radar && cd clip-radar
@@ -130,7 +177,7 @@ volume). Edit it (`docker exec -it clipradar-gateway sh`, or `docker cp` out and
     "since": "2026-11-18T00:00:00Z",
     "queue_cap": 3, "max_spots_per_run": 2, "clips_per_spot": 1, "length": "medium",
     "hashtags": ["#Name", "#gta6"], "campaign": "<campaign id from the Campaigns page>",
-    "accounts": [{"user": "<Upload-Post profile>", "platforms": ["youtube"], "name": "My Clips"}],
+    "accounts": [{"via": "upload-post", "user": "<Upload-Post profile>", "platforms": ["youtube"], "name": "My Clips"}],
     "layout": {"cam": [0, 0, 0.255, 0.256], "game_center": 0.5}
   }]
 }
@@ -139,7 +186,9 @@ volume). Edit it (`docker exec -it clipradar-gateway sh`, or `docker cp` out and
 - `layout.cam` is the webcam box as fractions of the 16:9 frame `[x0, y0, x1, y1]`. Grab a frame
   of the stream (`ffmpeg -ss 600 -i <vod url> -frames:v 1 f.jpg`) and measure. No `layout` =
   the core's own framing.
-- `accounts[].user` is a profile in Upload-Post with the social accounts connected there.
+- `accounts`: where the streamer's clips go (section 2c). A top-level `"accounts": [...]` next
+  to `streamers` is the fallback for every streamer without its own (ready clips of new
+  streamers use it). For Upload-Post, `user` is a profile with the social accounts connected.
   Platform ids are Upload-Post's (check their docs for X/TikTok/Instagram ids). YouTube custom
   covers need a phone-verified channel (youtube.com/verify), otherwise the post still goes out
   and the log says "youtube cover: error".
