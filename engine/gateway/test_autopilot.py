@@ -167,10 +167,11 @@ class TestStackedLayout(unittest.TestCase):
             {"id": "b" * 32, "streamer": "clix", "status": "review", "video_path": self.ENGINE},
             {"id": "c" * 32, "streamer": "lacy", "status": "posted", "video_path": self.ENGINE}], "log": []})
         self.pilot = Autopilot(self.dir, None, None, None, None, None)
-        self.calls = []
+        self.calls, self.hooks = [], []
 
-        def fake_render(path, layout, out_dir, item_id, captions=True):
+        def fake_render(path, layout, out_dir, item_id, captions=True, hook=None):
             self.calls.append((path, item_id, captions))
+            self.hooks.append(hook)
             return f"/videos/stacked/{item_id}-0123abcd.mp4"
         patcher = mock.patch.object(stacked, "render", side_effect=fake_render)
         patcher.start()
@@ -219,6 +220,29 @@ class TestStackedLayout(unittest.TestCase):
         self.assertEqual(item["layout"], "engine")
         self.assertEqual(item["video_path"], self.ENGINE)
         self.assertIn("stretch gone", item["layout_error"])
+
+    def test_stacked_clips_carry_their_hook(self):
+        from autopilot import load_state, save_state
+        state = load_state(self.dir)
+        state["items"][0]["hook"] = "He stole a car for his mom 💀"
+        save_state(self.dir, state)
+        self.pilot.restack_new()
+        self.assertEqual(self.hooks, ["He stole a car for his mom"])
+
+    def test_clips_of_an_older_look_are_rendered_again_once(self):
+        import stacked
+        from autopilot import load_state, save_state
+        self.pilot.restack_new()
+        self.assertEqual(self.items()["a"]["stacked_version"], stacked.RENDER_VERSION)
+        state = load_state(self.dir)
+        state["items"][0]["stacked_version"] = stacked.RENDER_VERSION - 1
+        save_state(self.dir, state)
+        self.pilot.restack_new()
+        self.pilot.restack_new()
+        self.assertEqual(len(self.calls), 2)
+        self.assertIsNone(self.pilot.set_layout("a" * 32, "engine"))
+        self.pilot.restack_new()                         # a clip put back on the core layout stays there
+        self.assertEqual(len(self.calls), 2)
 
     def test_no_layout_change_while_a_headline_is_on(self):
         from autopilot import load_state, save_state

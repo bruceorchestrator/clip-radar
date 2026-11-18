@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 
 PREFIX = "/videos/stacked/"
 NAME = re.compile(r"[0-9a-f]{32}-[0-9a-f]{8}\.mp4")
@@ -35,7 +36,19 @@ FONTS_DIR = os.environ.get("FONTS_DIR", "/app/fonts")
 OUT_W, OUT_H = 1080, 1920
 FPS = 30
 CAPTION_SIZE = 104         # px on the 1080x1920 frame
+CAPTION_LOW = 0.24         # with a hook on the seam, captions sit this share of height above the bottom
 DURATION_SLACK = 0.6       # s; metadata clip length vs the core's clip
+# The core sometimes starts a clip on 10-20 s of the streamer saying nothing. A clip
+# must open on speech: when the first caption word comes later than this, the clip
+# starts just before it.
+MAX_SILENT_LEAD = 1.5      # s
+PRE_ROLL = 0.4             # s kept before the first word
+# The hook stays on screen for the whole clip, at the top of the game band.
+HOOK_SIZE = 66             # px
+HOOK_LINE_CHARS = 20
+HOOK_MAX_LINES = 3
+HOOK_GAP = 24              # px between the webcam band and the hook block
+RENDER_VERSION = 3         # bump when the look changes: queued clips are re-rendered
 
 CLIP = re.compile(r"/videos/(?P<job>[0-9a-f-]{36})/(?:subtitled_(?P<ts>\d+)_)?(?P=job)_stretch_clip_(?P<n>\d+)\.mp4")
 
@@ -94,12 +107,41 @@ def geometry(src_w: int, src_h: int, cam: list[float], game_center: float = 0.5,
             "out": (out_w, out_h)}
 
 
-def restyle_ass(text: str, top_h: int, out_w: int = OUT_W, out_h: int = OUT_H,
-                size: int = CAPTION_SIZE) -> str:
-    """The core's captions moved to the seam between the webcam and the game.
+DIALOGUE = re.compile(r"^(Dialogue:\s*\d+,)([\d:.]+),([\d:.]+),")
 
-    Keeps every Dialogue line (timing, highlight colours, pop animation) and
-    rewrites only the canvas size and the Default style's size, outline and place.
+
+def _secs(stamp: str) -> float:
+    h, m, s = stamp.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _stamp(sec: float) -> str:
+    sec = max(0.0, sec)
+    return f"{int(sec // 3600)}:{int(sec % 3600 // 60):02d}:{sec % 60:05.2f}"
+
+
+def first_word(ass_text: str) -> float | None:
+    """When the first caption word starts (s, clip-relative), None without words."""
+    starts = [_secs(m.group(2)) for line in ass_text.splitlines() for m in [DIALOGUE.match(line.lstrip("﻿"))] if m]
+    return min(starts) if starts else None
+
+
+def silent_lead(ass_text: str | None) -> float:
+    """Seconds to cut from the clip's start so it opens on speech (0 when it already does)."""
+    word = first_word(ass_text) if ass_text else None
+    if word is None or word <= MAX_SILENT_LEAD:
+        return 0.0
+    return round(word - PRE_ROLL, 2)
+
+
+def restyle_ass(text: str, top_h: int, out_w: int = OUT_W, out_h: int = OUT_H,
+                size: int = CAPTION_SIZE, shift: float = 0.0, low: bool = False) -> str:
+    """The core's captions on the stacked frame: on the webcam/game seam, or (`low`,
+    when the hook sits under the webcam) in the lower part of the game.
+
+    Keeps every Dialogue line (highlight colours, pop animation), moves its timing
+    `shift` seconds earlier (the clip's silent start was cut; lines that end before
+    the new start go), and rewrites the canvas size and the Default style.
     """
     out, fields = [], None
     for line in text.splitlines():
@@ -109,21 +151,47 @@ def restyle_ass(text: str, top_h: int, out_w: int = OUT_W, out_h: int = OUT_H,
         if stripped.strip() == "[Script Info]":
             out += ["[Script Info]", f"PlayResX: {out_w}", f"PlayResY: {out_h}"]
             continue
-        if stripped.startswith("Format:") and fields is None and "Fontsize" in stripped:
+        dialogue = DIALOGUE.match(stripped)
+        if dialogue and shift:
+            start, end = _secs(dialogue.group(2)) - shift, _secs(dialogue.group(3)) - shift
+            if end <= 0:
+                continue
+            stripped = f"{dialogue.group(1)}{_stamp(start)},{_stamp(end)}," + stripped[dialogue.end():]
+        elif stripped.startswith("Format:") and fields is None and "Fontsize" in stripped:
             fields = [f.strip() for f in stripped[len("Format:"):].split(",")]
         elif stripped.startswith("Style:") and fields:
             values = [v.strip() for v in stripped[len("Style:"):].split(",")]
             if len(values) == len(fields):
                 style = dict(zip(fields, values))
                 style.update(Fontsize=str(size), Outline=str(max(4, size // 14)), Shadow="0",
-                             Alignment="8", MarginL="40", MarginR="40",
-                             MarginV=str(max(0, top_h - int(size * 0.6))))
+                             MarginL="40", MarginR="40")
+                if low:
+                    style.update(Alignment="2", MarginV=str(int(out_h * CAPTION_LOW)))
+                else:
+                    style.update(Alignment="8", MarginV=str(max(0, top_h - int(size * 0.6))))
                 stripped = "Style: " + ",".join(style[f] for f in fields)
         out.append(stripped)
     return "\n".join(out) + "\n"
 
 
-def filter_graph(geom: dict, ass_path: str | None) -> str:
+def hook_lines(text: str | None) -> list[str]:
+    """The hook in capitals, wrapped for the vertical frame, at most HOOK_MAX_LINES."""
+    text = re.sub(r"\s+", " ", text or "").strip().upper()
+    return textwrap.wrap(text, HOOK_LINE_CHARS)[:HOOK_MAX_LINES]
+
+
+def hook_filter(textfiles: list[str], top_h: int, font: str) -> str:
+    """White capitals on black boxes just under the webcam band (never over the face),
+    whole clip long."""
+    pad = int(HOOK_SIZE * 0.3)
+    step = HOOK_SIZE + 2 * pad + int(HOOK_SIZE * 0.12)
+    top = top_h + pad + HOOK_GAP
+    return ",".join(f"drawtext=fontfile={font}:textfile={path}:fontsize={HOOK_SIZE}:fontcolor=white"
+                    f":box=1:boxcolor=black:boxborderw={pad}:x=(w-tw)/2:y={top + i * step}"
+                    for i, path in enumerate(textfiles))
+
+
+def filter_graph(geom: dict, ass_path: str | None, hook: str = "") -> str:
     cx, cy, cw, ch = geom["cam"]
     gx, gy, gw, gh = geom["game"]
     out_w, _ = geom["out"]
@@ -133,6 +201,8 @@ def filter_graph(geom: dict, ass_path: str | None) -> str:
              f"[top][bot]vstack=inputs=2,fps={FPS},format=yuv420p")
     if ass_path:
         graph += f",subtitles={ass_path}:fontsdir={FONTS_DIR}"
+    if hook:
+        graph += "," + hook
     return graph + "[v]"
 
 
@@ -162,7 +232,12 @@ def sources(video_path: str, output_dir: str = ENGINE_OUTPUT, uploads_dir: str =
     if clip["ts"]:
         found = sorted(glob.glob(os.path.join(job_dir, f"autosubs_{clip['ts']}_*.ass")))
         ass = found[0] if found else None
-    return {"stretch": stretch, "start": start, "end": end, "ass": ass}
+    lead = 0.0
+    if ass:
+        with open(ass, encoding="utf-8-sig") as fh:
+            lead = min(silent_lead(fh.read()), max(0.0, end - start - 1.0))
+    # `start` already skips a silent opening; `lead` is how much was skipped.
+    return {"stretch": stretch, "start": start + lead, "end": end, "ass": ass, "lead": lead}
 
 
 def _probe(path: str) -> tuple[int, int]:
@@ -174,12 +249,17 @@ def _probe(path: str) -> tuple[int, int]:
 
 
 def render(video_path: str, layout: dict, out_dir: str, item_id: str, captions: bool = True,
+           hook: str | None = None, font: str = os.environ.get("HEADLINE_FONT", "/app/fonts/Anton-Regular.ttf"),
            output_dir: str = ENGINE_OUTPUT, uploads_dir: str = ENGINE_UPLOADS) -> str:
-    """Render the stacked version of a core clip; returns its /videos/stacked/ path."""
+    """Render the stacked version of a core clip; returns its /videos/stacked/ path.
+
+    Starts on the first spoken word (see sources), keeps `hook` on the seam for the
+    whole clip (captions then move lower), captions only when `captions`."""
     src = sources(video_path, output_dir, uploads_dir)
     src_w, src_h = _probe(src["stretch"])
     geom = geometry(src_w, src_h, layout["cam"], float(layout.get("game_center", 0.5)))
-    key = json.dumps([video_path, layout, captions, CAPTION_SIZE], sort_keys=True)
+    rows = hook_lines(hook)
+    key = json.dumps([video_path, layout, captions, CAPTION_SIZE, rows, RENDER_VERSION], sort_keys=True)
     name = f"{item_id}-{hashlib.sha1(key.encode()).hexdigest()[:8]}.mp4"
     out_path = os.path.join(out_dir, name)
     if os.path.exists(out_path):
@@ -189,13 +269,21 @@ def render(video_path: str, layout: dict, out_dir: str, item_id: str, captions: 
         if captions and src["ass"]:
             ass_path = os.path.join(tmp, "captions.ass")
             with open(src["ass"], encoding="utf-8-sig") as fh:
-                styled = restyle_ass(fh.read(), geom["top_h"], *geom["out"])
+                styled = restyle_ass(fh.read(), geom["top_h"], *geom["out"], shift=src["lead"], low=bool(rows))
             with open(ass_path, "w", encoding="utf-8") as fh:
                 fh.write(styled)
+        hook_files = []
+        for i, row in enumerate(rows):
+            path = os.path.join(tmp, f"hook{i}.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(row)
+            hook_files.append(path)
+        hook_graph = hook_filter(hook_files, geom["top_h"], font) if hook_files else ""
         tmp_out = os.path.join(tmp, "out.mp4")
         run = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y",
                               "-ss", f"{src['start']:.3f}", "-to", f"{src['end']:.3f}", "-i", src["stretch"],
-                              "-filter_complex", filter_graph(geom, ass_path), "-map", "[v]", "-map", "0:a?",
+                              "-filter_complex", filter_graph(geom, ass_path, hook_graph),
+                              "-map", "[v]", "-map", "0:a?",
                               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                               "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", tmp_out],
                              timeout=900, capture_output=True, text=True)

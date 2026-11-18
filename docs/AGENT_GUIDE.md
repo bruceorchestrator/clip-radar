@@ -46,8 +46,11 @@ trigger -> radar -> stretch -> core (Whisper + LLM + crop + captions) -> score f
 4. **Score filter.** Clips scoring at least `min_score` (70) join the review queue; Telegram ping.
 5. **Gateway post-processing (ffmpeg):**
    - `stacked.py`: re-cuts the same stretch from the 1080p source with fixed boxes: the
-     streamer's webcam (per-streamer `layout.cam`) fills the top band, the game the rest,
-     captions sit on the seam. Done automatically, one clip per loop pass.
+     streamer's webcam (per-streamer `layout.cam`) fills the top band, the game the rest.
+     The hook stays on screen the whole clip just under the webcam, captions sit lower in the
+     game. A clip that opens on more than 1.5 s without speech starts 0.4 s before the first
+     word instead. Done automatically, one clip per loop pass; bumping `RENDER_VERSION`
+     re-renders queued clips in the new look.
    - `headline.py`: optional, replaces captions with a big headline when Whisper failed
      (music, shouting).
 6. **Campaign check (`campaigns.py`, `clip_campaigns.py`).** Each campaign brief (built in, or

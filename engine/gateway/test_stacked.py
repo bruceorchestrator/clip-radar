@@ -62,6 +62,46 @@ class TestCaptions(unittest.TestCase):
         self.assertIn("{\\c&H00E5FF&}WELL,{\\r} THAT", out)
 
 
+LATE_ASS = ENGINE_ASS.replace("0:00:00.35,0:00:00.85", "0:00:13.10,0:00:13.60") + \
+    "Dialogue: 0,0:00:00.00,0:00:00.20,Default,,0,0,0,,{\\c&H00E5FF&}uh\n"
+
+
+class TestSilentStart(unittest.TestCase):
+    def test_a_clip_that_starts_on_speech_is_left_alone(self):
+        self.assertEqual(stacked.silent_lead(ENGINE_ASS), 0.0)
+        self.assertEqual(stacked.silent_lead(None), 0.0)
+
+    def test_a_long_silent_opening_is_cut_to_just_before_the_first_word(self):
+        late = ENGINE_ASS.replace("0:00:00.35,0:00:00.85", "0:00:13.10,0:00:13.60")
+        self.assertAlmostEqual(stacked.silent_lead(late), 13.1 - stacked.PRE_ROLL)
+
+    def test_captions_move_with_the_cut_and_early_lines_go(self):
+        out = stacked.restyle_ass(LATE_ASS, top_h=608, shift=12.7)
+        dialogues = [line for line in out.splitlines() if line.startswith("Dialogue:")]
+        self.assertEqual(len(dialogues), 1)
+        self.assertTrue(dialogues[0].startswith("Dialogue: 0,0:00:00.40,0:00:00.90,Default"))
+        self.assertIn("WELL,", dialogues[0])
+
+
+class TestHook(unittest.TestCase):
+    def test_hook_lines_are_capitals_and_short(self):
+        rows = stacked.hook_lines("He stole a car for his mom and then drove it straight into the ocean again")
+        self.assertLessEqual(len(rows), stacked.HOOK_MAX_LINES)
+        self.assertTrue(all(len(r) <= stacked.HOOK_LINE_CHARS and r == r.upper() for r in rows))
+        self.assertEqual(stacked.hook_lines("  "), [])
+
+    def test_hook_sits_under_the_webcam_and_captions_move_low(self):
+        graph = stacked.hook_filter(["/t/hook0.txt", "/t/hook1.txt"], 608, "/f.ttf")
+        self.assertEqual(graph.count("drawtext="), 2)
+        ys = [int(y) for y in __import__("re").findall(r":y=(\d+)", graph)]
+        self.assertGreater(ys[0], 608)                # below the webcam band, not on the face
+        self.assertGreater(ys[1], ys[0])
+        style = next(line for line in stacked.restyle_ass(ENGINE_ASS, 608, low=True).splitlines()
+                     if line.startswith("Style:")).split(",")
+        self.assertEqual(style[18], "2")                          # bottom-centre anchor
+        self.assertEqual(int(style[21]), int(1920 * stacked.CAPTION_LOW))
+
+
 class TestSources(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
@@ -77,7 +117,8 @@ class TestSources(unittest.TestCase):
             json.dump({"ranges": [{"start": 0, "end": 24.583}]}, fh)
         with open(os.path.join(self.out, JOB, f"{JOB}_stretch_clip_2.mp4.layout.json"), "w") as fh:
             json.dump({"ranges": [{"start": 0, "end": 12.0}]}, fh)   # cut down: not one straight piece
-        open(os.path.join(self.out, JOB, "autosubs_1795015279_d2fcbd7e.ass"), "w").close()
+        with open(os.path.join(self.out, JOB, "autosubs_1795015279_d2fcbd7e.ass"), "w") as fh:
+            fh.write(ENGINE_ASS.replace("0:00:00.35,0:00:00.85", "0:00:05.00,0:00:05.50"))
         open(os.path.join(self.up, f"{JOB}_stretch.mp4"), "w").close()
 
     def tearDown(self):
@@ -92,7 +133,9 @@ class TestSources(unittest.TestCase):
 
     def test_sources_finds_the_stretch_times_and_captions(self):
         src = stacked.sources(f"/videos/{JOB}/subtitled_1795015279_{JOB}_stretch_clip_1.mp4", self.out, self.up)
-        self.assertEqual((src["start"], src["end"]), (11.64, 36.2))
+        self.assertAlmostEqual(src["lead"], 5.0 - stacked.PRE_ROLL)        # silent opening cut
+        self.assertAlmostEqual(src["start"], 11.64 + 5.0 - stacked.PRE_ROLL)
+        self.assertEqual(src["end"], 36.2)
         self.assertTrue(src["ass"].endswith("autosubs_1795015279_d2fcbd7e.ass"))
         self.assertTrue(src["stretch"].endswith(f"{JOB}_stretch.mp4"))
 
@@ -128,7 +171,8 @@ class TestRender(unittest.TestCase):
             with open(os.path.join(out_dir, JOB, "autosubs_17_x.ass"), "w") as fh:
                 fh.write(ENGINE_ASS)
             path = stacked.render(f"/videos/{JOB}/subtitled_17_{JOB}_stretch_clip_1.mp4", {"cam": LACY_CAM},
-                                  stacked.folder(data), "a" * 32, output_dir=out_dir, uploads_dir=up_dir)
+                                  stacked.folder(data), "a" * 32, hook="He stole a car for his mom",
+                                  output_dir=out_dir, uploads_dir=up_dir)
             local = stacked.local_file(data, path)
             probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height:format=duration",
                                     "-of", "json", local], capture_output=True, text=True, check=True).stdout

@@ -497,8 +497,11 @@ class Autopilot:
         instead of after the whole queue. Renders outside the state lock."""
         with STATE_LOCK:
             state = load_state(self.data_dir)
+            # New clips, and stacked clips rendered by an older look (stacked.RENDER_VERSION).
             todo = [(i, layout) for i in state.get("items", [])
-                    if i.get("status") == "review" and "layout" not in i and not i.get("headline")
+                    if i.get("status") == "review" and not i.get("headline")
+                    and ("layout" not in i or (i.get("layout") == "stacked"
+                                               and i.get("stacked_version") != stacked.RENDER_VERSION))
                     for layout in [self._streamer_layout(i.get("streamer"))] if layout]
         if not todo:
             return False
@@ -528,14 +531,21 @@ class Autopilot:
         if item.get("headline"):
             return "go back to captions first"
         engine_path = item.get("engine_video_path") or item["video_path"]
-        new_path = engine_path
+        engine_duration = item.get("engine_duration", item.get("duration"))
+        new_path, duration = engine_path, engine_duration
         if which == "stacked":
             if not layout:
                 return "this streamer has no webcam box set"
             try:
-                new_path = stacked.render(engine_path, layout, stacked.folder(self.data_dir), item_id)
+                new_path = stacked.render(engine_path, layout, stacked.folder(self.data_dir), item_id,
+                                          hook=thumbnail.hook_text(item))
             except Exception as exc:
                 return f"could not stack the clip: {str(exc)[:160]}"
+            try:
+                src = stacked.sources(engine_path)
+                duration = round(src["end"] - src["start"], 1)     # a silent opening was cut
+            except (OSError, ValueError):
+                pass
         with STATE_LOCK:
             state = load_state(self.data_dir)
             item = next((i for i in state.get("items", []) if i.get("id") == item_id), None)
@@ -543,7 +553,10 @@ class Autopilot:
                 return "not found"
             if item.get("headline"):
                 return "go back to captions first"
-            item.update(layout=which, engine_video_path=engine_path, video_path=new_path, updated=time.time())
+            item.update(layout=which, engine_video_path=engine_path, video_path=new_path,
+                        engine_duration=engine_duration, duration=duration, updated=time.time())
+            if which == "stacked":
+                item["stacked_version"] = stacked.RENDER_VERSION
             item.pop("layout_error", None)
             log(state, f"{item_id[:8]}: " + ("webcam-on-top layout" if which == "stacked" else "core layout"))
             save_state(self.data_dir, state)
