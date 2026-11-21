@@ -5,6 +5,7 @@ import type { Autopilot, AutopilotAction, AutopilotItem } from "@/lib/engine";
 import { CampaignChecklist } from "@/components/campaign-checklist";
 import { HeadlineControl } from "@/components/headline-control";
 import { LayoutControl } from "@/components/layout-control";
+import { postResult, type Notice } from "@/lib/post-result";
 
 const POLL_MS = 15_000;
 
@@ -33,6 +34,10 @@ export function AutopilotView() {
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<AutopilotItem["status"]>("review");
   const [busy, setBusy] = useState<string | null>(null);
+  // The button being pressed ("<item id>:<account user>"), so it can say "Posting…".
+  const [pressed, setPressed] = useState<string | null>(null);
+  // Result of the last action. Kept apart from `error`, which every poll clears.
+  const [notice, setNotice] = useState<Notice | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -42,10 +47,12 @@ export function AutopilotView() {
       else {
         setError(null);
         setData(body);
+        return body;
       }
     } catch {
       setError("Lost the connection. Retrying…");
     }
+    return null;
   }, []);
 
   useEffect(() => {
@@ -62,8 +69,12 @@ export function AutopilotView() {
     };
   }, [load]);
 
-  async function act(id: string, action: AutopilotAction, campaign?: string, text?: string) {
+  async function act(id: string, action: AutopilotAction, campaign?: string, text?: string, accountName?: string) {
     setBusy(id);
+    if (action === "post") {
+      setPressed(`${id}:${campaign}`);
+      setNotice({ kind: "wait", text: `Posting to ${accountName ?? "the channel"}… uploading can take a minute.` });
+    }
     try {
       const response = await fetch(`/api/autopilot/items/${id}`, {
         method: "POST",
@@ -72,11 +83,17 @@ export function AutopilotView() {
       });
       if (!response.ok) {
         const body = (await response.json().catch(() => ({}))) as { error?: string };
-        setError(body.error ?? "Could not update the clip.");
+        setNotice({ kind: "bad", text: body.error ?? "Could not update the clip." });
+        await load();
+        return;
       }
-      await load();
+      const fresh = await load();
+      if (action === "post") setNotice(postResult(fresh?.items.find((i) => i.id === id), accountName));
+    } catch {
+      setNotice({ kind: "bad", text: "Lost the connection. Check the Posted tab before pressing again." });
     } finally {
       setBusy(null);
+      setPressed(null);
     }
   }
 
@@ -120,6 +137,26 @@ export function AutopilotView() {
       </section>
 
       {error ? <p className="text-sm text-warn">{error}</p> : null}
+
+      {notice ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed inset-x-4 bottom-4 z-50 mx-auto flex max-w-xl items-start gap-3 rounded-2xl border bg-panel p-4 text-sm shadow-lg ${
+            notice.kind === "bad" ? "border-bad text-bad" : notice.kind === "ok" ? "border-good text-good" : "border-line text-fg"
+          }`}
+        >
+          <p className="min-w-0 flex-1 break-words">
+            {notice.text}{" "}
+            {notice.url ? (
+              <a href={notice.url} target="_blank" rel="noreferrer" className="text-accent underline">{notice.url}</a>
+            ) : null}
+          </p>
+          {notice.kind !== "wait" ? (
+            <button type="button" onClick={() => setNotice(null)} aria-label="Close" className="text-muted hover:text-fg">×</button>
+          ) : null}
+        </div>
+      ) : null}
 
       <nav aria-label="Queue" className="flex flex-wrap gap-2">
         {TABS.map((t) => (
@@ -188,10 +225,10 @@ export function AutopilotView() {
                         type="button"
                         disabled={busy === item.id || item.verdict === "fail"}
                         title={item.verdict === "fail" ? "This clip breaks the campaign brief" : undefined}
-                        onClick={() => act(item.id, "post", a.user)}
+                        onClick={() => act(item.id, "post", a.user, undefined, a.name)}
                         className="rounded-full bg-accent px-4 py-2 text-sm font-medium text-accent-ink disabled:opacity-60"
                       >
-                        Post to {a.name}
+                        {pressed === `${item.id}:${a.user}` ? `Posting to ${a.name}…` : `Post to ${a.name}`}
                       </button>
                     ))}
                     <button type="button" disabled={busy === item.id} onClick={() => act(item.id, "reject")} className="rounded-full border border-line px-4 py-2 text-sm hover:border-muted disabled:opacity-60">
